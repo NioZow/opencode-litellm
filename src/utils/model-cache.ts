@@ -99,12 +99,13 @@ function canonicalize(value: unknown): string {
 /**
  * Cache identity for a provider's model view. `providerId@baseURL`
  * alone isn't enough: `includeModels`/`excludeModels`,
- * `modelCapabilities` and the naming choices (`formatModelNames`,
- * `modelNameTemplate`) are baked into cached entries by discovery, so a
- * config change must not reuse the old cache — it would keep serving the
- * previous adjusted view until a second restart. A fingerprint is appended
- * whenever adjustments exist (pattern order ignored); default configs keep
- * the plain key so existing caches stay warm across plugin upgrades.
+ * `modelCapabilities`, `modelLimits` and the naming choices
+ * (`formatModelNames`, `modelNameTemplate`) are baked into cached entries
+ * by discovery, so a config change must not reuse the old cache — it would
+ * keep serving the previous adjusted view until a second restart. A
+ * fingerprint is appended whenever adjustments exist (pattern order
+ * ignored); default configs keep the plain key so existing caches stay
+ * warm across plugin upgrades.
  *
  * `providerName` only matters when a template is set: `{provider_name}`
  * resolves to it, so renaming a provider must start a fresh discovery too.
@@ -117,6 +118,7 @@ export function buildCacheKey(
   capabilities: Record<string, Record<string, boolean>>,
   naming: ModelNaming = {},
   credential?: string,
+  limits: Record<string, { context?: number; output?: number }> = {},
 ): string {
   let base = `${providerId}@${baseURL}`
   // The credential fingerprint: a short hash (never the raw key) so a
@@ -132,6 +134,7 @@ export function buildCacheKey(
     (filters.includeModels?.length ?? 0) > 0 ||
     (filters.excludeModels?.length ?? 0) > 0 ||
     Object.keys(capabilities).length > 0 ||
+    Object.keys(limits).length > 0 ||
     rawNames ||
     template !== undefined
   if (!hasAdjustments) return base
@@ -151,6 +154,9 @@ export function buildCacheKey(
         includeModels: filters.includeModels ? [...filters.includeModels].sort() : undefined,
         excludeModels: filters.excludeModels ? [...filters.excludeModels].sort() : undefined,
         capabilities,
+        // Omitted (not `{}`) when no override exists, so keys for configs
+        // that never touch this option are unchanged.
+        modelLimits: Object.keys(limits).length > 0 ? limits : undefined,
         ...namingFingerprint,
       }),
     )

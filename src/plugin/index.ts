@@ -36,6 +36,8 @@ import { passesModelFilter } from '../utils/model-filter'
 import type { ModelFilters } from '../utils/model-filter'
 import { applyCapabilityOverrides, parseModelCapabilities } from '../utils/model-capabilities'
 import type { ModelCapabilities } from '../utils/model-capabilities'
+import { applyLimitOverrides, parseModelLimits } from '../utils/model-limits'
+import type { ModelLimits } from '../utils/model-limits'
 
 const CHAT_PROVIDER_ID = 'litellm'
 // The OpenCode 1 config hook can only choose a runtime package per provider,
@@ -116,6 +118,7 @@ interface RefreshContext {
   customHeaders?: Record<string, string>
   filters: ModelFilters
   capabilities: ModelCapabilities
+  limits: ModelLimits
   formatModelNames: boolean
   modelNameTemplate?: string
   providerName: string
@@ -440,6 +443,7 @@ export async function discoverModels(
   filters: ModelFilters = {},
   capabilities: ModelCapabilities = {},
   naming: ModelNaming = {},
+  limits: ModelLimits = {},
 ): Promise<DiscoveredModels | null> {
   if (!(await checkLiteLLMHealth(baseURL, apiKey, customHeaders))) {
     log(
@@ -519,7 +523,9 @@ export async function discoverModels(
       skipped++
       continue
     }
-    built[model.id] = entry
+    // `modelLimits` corrects a limit the proxy reports wrongly (e.g. an
+    // output ceiling of 0, which OpenCode would send as `max_tokens`).
+    built[model.id] = applyLimitOverrides(entry, limits[model.id])
     if (requiresResponsesAPI(enriched)) responsesIds.push(model.id)
     const params = info?.supported_openai_params
     hints[model.id] = {
@@ -818,6 +824,7 @@ async function backgroundRefresh(cacheKey: string): Promise<void> {
           providerId: ctx.providerId,
           providerName: ctx.providerName,
         },
+        ctx.limits,
       ),
       DISCOVERY_TIMEOUT_MS,
     )
@@ -974,6 +981,7 @@ export const LiteLLMPlugin: Plugin = async (input: PluginInput) => {
         const runtimeFetch = sso ? ssoFetch(session, customHeaders) : undefined
         const filters = readModelFilters(options)
         const capabilities = parseModelCapabilities(options.modelCapabilities)
+        const limits = parseModelLimits(options.modelLimits)
         const formatModelNames = readFormatModelNames(options)
         const modelNameTemplate = readModelNameTemplate(options)
         // `{provider_name}` resolves to what the picker labels the provider
@@ -1045,7 +1053,7 @@ export const LiteLLMPlugin: Plugin = async (input: PluginInput) => {
 
         const models = actualProvider.models as Record<string, unknown>
 
-        // Identity includes the filter/capability/naming config: those
+        // Identity includes the filter/capability/limit/naming config: those
         // are baked into cached entries, so changing them must start a
         // fresh discovery instead of serving the old adjusted view.
         // The cache key is isolated by the effective credential (a fingerprint,
@@ -1057,7 +1065,7 @@ export const LiteLLMPlugin: Plugin = async (input: PluginInput) => {
           formatModelNames,
           modelNameTemplate,
           providerName,
-        }, sso ? ssoIdentity(sso) : apiKey)
+        }, sso ? ssoIdentity(sso) : apiKey, limits)
 
         // Remember how to reach this proxy so the `event` hook can
         // revalidate its cache in the background on new sessions.
@@ -1072,6 +1080,7 @@ export const LiteLLMPlugin: Plugin = async (input: PluginInput) => {
           customHeaders,
           filters,
           capabilities,
+          limits,
           formatModelNames,
           modelNameTemplate,
           providerName,
@@ -1143,6 +1152,7 @@ export const LiteLLMPlugin: Plugin = async (input: PluginInput) => {
             filters,
             capabilities,
             { formatModelNames, modelNameTemplate, providerId, providerName },
+            limits,
           ),
           DISCOVERY_TIMEOUT_MS,
         )

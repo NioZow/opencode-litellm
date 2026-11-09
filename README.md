@@ -83,6 +83,7 @@ also shows how to configure a provider directly in `opencode.json`.
 | 🌐 **Gateway-friendly** | Supports provider `headers` (and the legacy `customHeaders` option) for proxies behind Cloudflare Access or other API gateways. |
 | 🧩 **Splittable catalog** | `includeModels` / `excludeModels` (glob patterns) let one LiteLLM proxy be divided into several OpenCode providers — e.g. by naming prefix — without hand-maintaining a model list. |
 | 🎚️ **Capability overrides** | `modelCapabilities` forces or retracts per-model capability flags (`supports_vision`, `supports_function_calling`, …) when `/v1/model/info` is unavailable or disagrees with your deployment. |
+| 📏 **Limit overrides** | `modelLimits` corrects a per-model `context`/`output` limit the proxy reports wrongly — e.g. an output ceiling of `0`, which OpenCode would send as `max_tokens` and truncate long answers with. |
 | 💾 **Prompt caching (OpenCode 2.0.28+)** | Chat models whose deployment accepts Anthropic `cache_control` markers are registered with `compatibility.cacheFormat: "anthropic"`, so OpenCode 2 places cache breakpoints as it does for a native Anthropic provider. `modelCompatibility` corrects this per model. |
 | ⏱️ **Bounded startup** | Health checks fail fast (3 s); discovery fetches are capped at **15 s** (configurable via `LITELLM_REQUEST_TIMEOUT_MS`) for slow remote proxies. V2 model refresh runs in the background. |
 | 📝 **OpenCode logging** | V1 logs go through OpenCode's log API; V2 logs use the V2 plugin host's console logging. |
@@ -470,6 +471,29 @@ Model classification (tool-call badge, attachments, reasoning, input modalities)
 - When `/v1/model/info` reports no modality flags, discovered chat models are registered as text-only. This avoids OpenCode's image-capable fallback for text-only deployments; set `supports_vision: true` explicitly for a route that has a working multimodal projector.
 - Changing `modelCapabilities` (or `includeModels`/`excludeModels`) starts a fresh discovery on the next start — the cache is scoped by that config — so the picker reflects the new flags immediately.
 
+### Correcting token limits (`modelLimits`)
+
+Each discovered model's `limit` block comes straight from the proxy (`max_input_tokens` / `max_output_tokens` in `/v1/model/info`). OpenCode sends that `output` value as the request's `max_tokens`, so a proxy that advertises `0` — or a ceiling lower than the model's real one — caps or truncates long answers, which often looks like a reasoning model that "thinks for a while and never answers". Override the limits per model id:
+
+```jsonc
+{
+  "providers": {
+    "litellm": {
+      "settings": {
+        "baseURL": "http://localhost:4000/v1",
+        "modelLimits": {
+          "mistral/zai-glm-5-3-flash": { "context": 1048576, "output": 131072 }
+        }
+      }
+    }
+  }
+}
+```
+
+- Keys are exact model ids as they appear in `/v1/models` (not globs); only the fields you name are replaced.
+- Non-positive or non-finite numbers are ignored, so a typo can't register a `0`-token limit.
+- Like `modelCapabilities`, the overrides are baked into the cached view and scoped into the cache key, so a change starts a fresh discovery on the next start.
+
 ### Keeping raw model ids in the picker (`formatModelNames`)
 
 By default the plugin prettifies each discovered id into a display name — `anthropic/claude-3-5-sonnet` shows up as `Claude 3.5 Sonnet`. If you'd rather see your LiteLLM `model_list` aliases verbatim (for example because your team refers to models by those exact names, or the formatter mangles an internal naming scheme), turn formatting off:
@@ -771,6 +795,7 @@ src/
 │   ├── model-cache.ts          # stale-while-revalidate on-disk model cache
 │   ├── model-filter.ts         # includeModels/excludeModels glob filtering
 │   ├── model-capabilities.ts   # per-model capability flag overrides
+│   ├── model-limits.ts         # per-model context/output limit overrides
 │   ├── model-compatibility.ts  # cacheFormat inference and per-model overrides
 │   └── opencode-auth.ts        # fallback to OpenCode's /connect-stored credentials
 └── plugin/
