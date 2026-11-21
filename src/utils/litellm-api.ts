@@ -5,12 +5,21 @@ import { resolveReasoningEfforts } from './reasoning-efforts'
 export const DEFAULT_LITELLM_URL = 'http://localhost:4000'
 const MODELS_ENDPOINT = '/v1/models'
 const MODEL_INFO_ENDPOINT = '/v1/model/info'
-// Health checks fail fast so auto-detection stays snappy; the actual
-// discovery fetches get a generous budget because `/v1/model/info`
-// payloads from remote proxies with many database-defined models can
-// be large and slow to generate.
-const HEALTH_TIMEOUT_MS = 3000
+// Health checks originally failed fast (3 s) so auto-detection stayed
+// snappy, but a proxy that boots lazily — behind a VM, container or
+// remote host start-up — is then reported as offline and discovery is
+// skipped until OpenCode restarts. The budget is configurable now and
+// generous by default; the discovery fetches keep their own budget
+// because `/v1/model/info` payloads from remote proxies with many
+// database-defined models can be large and slow to generate.
+const DEFAULT_HEALTH_TIMEOUT_MS = 15000
 const DEFAULT_FETCH_TIMEOUT_MS = 15000
+
+/**
+ * Historical name of the health-check budget, kept exported for callers
+ * that referenced it. The effective value is `getHealthTimeoutMs()`.
+ */
+export const HEALTH_TIMEOUT_MS = DEFAULT_HEALTH_TIMEOUT_MS
 
 /**
  * Per-request timeout for discovery fetches (`/v1/models`,
@@ -25,6 +34,22 @@ export function getRequestTimeoutMs(): number {
   // default instead of silently truncating to a bogus 12 ms timeout.
   const parsed = Number(raw)
   if (!Number.isInteger(parsed) || parsed <= 0) return DEFAULT_FETCH_TIMEOUT_MS
+  return parsed
+}
+
+/**
+ * Timeout for the health probe (`/v1/models`), overridable via
+ * `OPENCODE_LITELLM_HEALTH_TIMEOUT_MS`. Unset or invalid values fall
+ * back to the default, which is long enough for a proxy that is still
+ * starting inside a VM or container.
+ */
+export function getHealthTimeoutMs(): number {
+  const raw = process.env.OPENCODE_LITELLM_HEALTH_TIMEOUT_MS
+  if (!raw) return DEFAULT_HEALTH_TIMEOUT_MS
+  // Number() (not parseInt) so '7.5' or '15s' fall back to the default
+  // instead of silently truncating to a bogus 7 ms timeout.
+  const parsed = Number(raw)
+  if (!Number.isInteger(parsed) || parsed <= 0) return DEFAULT_HEALTH_TIMEOUT_MS
   return parsed
 }
 
@@ -59,25 +84,72 @@ function buildHeaders(apiKey?: string, customHeaders?: Record<string, string>): 
   return headers
 }
 
-/** Lightweight ping to see whether a LiteLLM server is reachable. */
+/**
+ * Why a health probe failed.
+ *
+ * `timeout` means the request was still pending when the budget expired:
+ * the proxy may simply be starting up. `http` carries the non-2xx status
+ * (401/403 included) and `unreachable` a transport error (DNS, refused
+ * connection). The distinction matters because the fixes differ, so the
+ * caller must be able to log them separately.
+ */
+export type LiteLLMHealthFailure =
+  | { healthy: false; kind: 'timeout'; timeoutMs: number }
+  | { healthy: false; kind: 'http'; status: number; statusText: string }
+  | { healthy: false; kind: 'unreachable'; message: string }
+
+/** Outcome of a health probe: either alive, or an identified failure. */
+export type LiteLLMHealthResult = { healthy: true; status: number } | LiteLLMHealthFailure
+
+/**
+ * Identify an abort that came from the timeout budget rather than from a
+ * caller-cancelled request. `AbortSignal.timeout` rejects with a
+ * `TimeoutError` DOMException on current Node and Bun.
+ */
+function isTimeoutError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false
+  const name = (error as { name?: unknown }).name
+  return name === 'TimeoutError' || name === 'AbortError'
+}
+
+/**
+ * Lightweight ping that reports *why* a LiteLLM server is unusable, so a
+ * slow start-up is not mistaken for a missing or misconfigured proxy.
+ */
+export async function probeLiteLLMHealth(
+  baseURL: string = DEFAULT_LITELLM_URL,
+  apiKey?: string,
+  customHeaders?: Record<string, string>,
+): Promise<LiteLLMHealthResult> {
+  const timeoutMs = getHealthTimeoutMs()
+  try {
+    const response = await fetch(buildAPIURL(baseURL), {
+      method: 'GET',
+      headers: buildHeaders(apiKey, customHeaders),
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    if (response.ok) return { healthy: true, status: response.status }
+    // 401 still means a server is alive — we just don't have the right
+    // credentials. Surface that as "unhealthy" so the user is prompted
+    // to set LITELLM_API_KEY.
+    return { healthy: false, kind: 'http', status: response.status, statusText: response.statusText }
+  } catch (error) {
+    if (isTimeoutError(error)) return { healthy: false, kind: 'timeout', timeoutMs }
+    return {
+      healthy: false,
+      kind: 'unreachable',
+      message: error instanceof Error ? error.message : String(error),
+    }
+  }
+}
+
+/** Boolean form of `probeLiteLLMHealth`, for callers that only need a verdict. */
 export async function checkLiteLLMHealth(
   baseURL: string = DEFAULT_LITELLM_URL,
   apiKey?: string,
   customHeaders?: Record<string, string>,
 ): Promise<boolean> {
-  try {
-    const response = await fetch(buildAPIURL(baseURL), {
-      method: 'GET',
-      headers: buildHeaders(apiKey, customHeaders),
-      signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS),
-    })
-    // 401 still means a server is alive — we just don't have the right
-    // credentials. Surface that as "unhealthy" so the user is prompted
-    // to set LITELLM_API_KEY.
-    return response.ok
-  } catch {
-    return false
-  }
+  return (await probeLiteLLMHealth(baseURL, apiKey, customHeaders)).healthy
 }
 
 /** Discover all models exposed by a LiteLLM proxy. */

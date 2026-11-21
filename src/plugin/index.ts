@@ -1,11 +1,12 @@
 import type { Plugin, PluginInput } from '@opencode-ai/plugin'
 import {
   autoDetectLiteLLM,
-  checkLiteLLMHealth,
   discoverLiteLLMModelInfo,
   discoverLiteLLMModels,
   getRequestTimeoutMs,
   normalizeBaseURL,
+  probeLiteLLMHealth,
+  type LiteLLMHealthFailure,
 } from '../utils/litellm-api'
 import {
   applyModelNameTemplate,
@@ -48,9 +49,9 @@ const RESPONSES_PROVIDER_SUFFIX = '-responses'
 const RESPONSES_NPM = '@ai-sdk/openai'
 // `@ai-sdk/openai` throws without an API key, even when the sign-in's `fetch` sends the real token.
 const SIGN_IN_PLACEHOLDER = 'litellm-sign-in'
-// Covers the 3 s health check plus the parallel models/model-info fetch
-// phase, with headroom. Scales with LITELLM_REQUEST_TIMEOUT_MS so slow
-// proxies aren't cut off by the overall cap either (issue #20).
+// Covers the health-check budget plus the parallel models/model-info
+// fetch phase, with headroom. Scales with LITELLM_REQUEST_TIMEOUT_MS so
+// slow proxies aren't cut off by the overall cap either (issue #20).
 export const DISCOVERY_TIMEOUT_MS = Math.max(20000, getRequestTimeoutMs() + 5000)
 // Don't revalidate a baseURL's cache more often than this, so a burst
 // of `session.created` events can't generate repeated discovery traffic.
@@ -175,6 +176,30 @@ export function isLiteLLMProvider(
   if (options['litellm-compatible'] === true) return true
   if (options.litellm_compatible === true) return true
   return false
+}
+
+/**
+ * Resolve the base URL a provider declares, accepting both config shapes:
+ * OpenCode 1 keeps it in `options.baseURL`, the V2 provider shape keeps it
+ * in `settings.baseURL`. Returns `undefined` when neither is set, so the
+ * caller can fall back to auto-detection.
+ *
+ * `options` is the caller's snapshot (see `userOptions`) where one exists,
+ * so a value this plugin wrote itself is never mistaken for user
+ * configuration.
+ */
+export function readConfiguredBaseURL(
+  provider: Record<string, unknown>,
+  options: Record<string, unknown>,
+): string | undefined {
+  const fromOptions = typeof options.baseURL === 'string' ? options.baseURL.trim() : ''
+  if (fromOptions) return fromOptions
+  const settings =
+    provider.settings && typeof provider.settings === 'object'
+      ? (provider.settings as Record<string, unknown>)
+      : undefined
+  const fromSettings = typeof settings?.baseURL === 'string' ? settings.baseURL.trim() : ''
+  return fromSettings || undefined
 }
 
 /**
@@ -414,6 +439,29 @@ export function toConfigModel(
 }
 
 /**
+ * Build the warning logged when the health probe fails, naming the actual
+ * failure. A proxy that is still starting up must not be reported as
+ * unauthorized: the remedy (wait, or raise the timeout) is different from
+ * the remedy for a rejected key. The `LiteLLM appears offline or
+ * unauthorized` prefix is kept for the non-2xx and transport cases so
+ * existing log scrapes still match.
+ */
+function healthFailureMessage(
+  failure: LiteLLMHealthFailure,
+  providerId: string,
+  baseURL: string,
+): string {
+  if (failure.kind === 'timeout') {
+    return `[opencode-litellm] LiteLLM health check timed out after ${failure.timeoutMs}ms for provider "${providerId}" at ${baseURL}`
+  }
+  const prefix = `[opencode-litellm] LiteLLM appears offline or unauthorized for provider "${providerId}" at ${baseURL}`
+  if (failure.kind === 'http') {
+    return `${prefix} (HTTP ${failure.status} ${failure.statusText})`
+  }
+  return `${prefix} (${failure.message})`
+}
+
+/**
  * Result of discovering a LiteLLM proxy's models.
  *
  * `models` is the `{ id -> entry }` map written into an OpenCode provider
@@ -456,11 +504,9 @@ export async function discoverModels(
   capabilities: ModelCapabilities = {},
   naming: ModelNaming = {},
 ): Promise<DiscoveredModels | null> {
-  if (!(await checkLiteLLMHealth(baseURL, apiKey, customHeaders))) {
-    log(
-      'warn',
-      `[opencode-litellm] LiteLLM appears offline or unauthorized for provider "${providerId}" at ${baseURL}`,
-    )
+  const health = await probeLiteLLMHealth(baseURL, apiKey, customHeaders)
+  if (!health.healthy) {
+    log('warn', healthFailureMessage(health, providerId, baseURL))
     return null
   }
 
@@ -647,7 +693,14 @@ function ensureResponsesProvider(
   }
   const options = provider.options as Record<string, unknown>
   const configured = userOptions(options)
-  if (!configured.baseURL) options.baseURL = `${baseURL}/v1`
+  const declaredBaseURL = readConfiguredBaseURL(provider, configured)
+  if (!declaredBaseURL) {
+    options.baseURL = `${baseURL}/v1`
+  } else if (!configured.baseURL) {
+    // A V2 `settings.baseURL` on the sibling: mirror it into `options`,
+    // which is the only field OpenCode 1's runtime reads.
+    options.baseURL = `${normalizeBaseURL(declaredBaseURL)}/v1`
+  }
   if (!configured.apiKey) {
     const key = apiKey ?? (runtimeFetch ? SIGN_IN_PLACEHOLDER : undefined)
     if (key) options.apiKey = key
@@ -948,8 +1001,9 @@ export const LiteLLMPlugin: Plugin = async (input: PluginInput) => {
         // Snapshot the object this plugin writes into, so a later run recognizes those writes.
         if (!provider.options || typeof provider.options !== 'object') provider.options = {}
         const options = userOptions(provider.options as Record<string, unknown>)
-        const configuredBase =
-          typeof options.baseURL === 'string' ? options.baseURL : undefined
+        // `options.baseURL` is the OpenCode 1 shape; the V2 provider config
+        // stores the same value in `settings.baseURL`.
+        const configuredBase = readConfiguredBaseURL(provider, options)
         const configuredKey =
           typeof options.apiKey === 'string' && options.apiKey
             ? options.apiKey
@@ -1036,7 +1090,7 @@ export const LiteLLMPlugin: Plugin = async (input: PluginInput) => {
         if (!baseURL) {
           log(
             'warn',
-            `[opencode-litellm] No LiteLLM proxy found for provider "${providerId}". Configure options.baseURL or start LiteLLM on port 4000/8000/8080.`,
+            `[opencode-litellm] No LiteLLM proxy found for provider "${providerId}". Configure options.baseURL (or settings.baseURL) or start LiteLLM on port 4000/8000/8080.`,
           )
           continue
         }
