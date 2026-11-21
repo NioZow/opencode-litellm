@@ -33,6 +33,7 @@ describe('OpenCode 1 config hook', () => {
   let originalHome: string | undefined
   let originalLiteLLMApiKey: string | undefined
   let originalLiteLLMMasterKey: string | undefined
+  let originalHealthAttempts: string | undefined
   let cacheDirectory: string
   let homeDirectory: string
 
@@ -41,6 +42,7 @@ describe('OpenCode 1 config hook', () => {
     originalHome = process.env.HOME
     originalLiteLLMApiKey = process.env.LITELLM_API_KEY
     originalLiteLLMMasterKey = process.env.LITELLM_MASTER_KEY
+    originalHealthAttempts = process.env.OPENCODE_LITELLM_HEALTH_ATTEMPTS
     delete process.env.LITELLM_API_KEY
     delete process.env.LITELLM_MASTER_KEY
     // Isolate the box auth store: tests must never read the developer's real
@@ -56,6 +58,7 @@ describe('OpenCode 1 config hook', () => {
     restoreEnv('HOME', originalHome)
     restoreEnv('LITELLM_API_KEY', originalLiteLLMApiKey)
     restoreEnv('LITELLM_MASTER_KEY', originalLiteLLMMasterKey)
+    restoreEnv('OPENCODE_LITELLM_HEALTH_ATTEMPTS', originalHealthAttempts)
     if (cacheDirectory) rmSync(cacheDirectory, { recursive: true, force: true })
     if (homeDirectory) rmSync(homeDirectory, { recursive: true, force: true })
     vi.restoreAllMocks()
@@ -115,6 +118,38 @@ describe('OpenCode 1 config hook', () => {
     }
     await plugin.config!(config as never)
     return config
+  }
+
+  /**
+   * Same as `runConfigHook`, but returns the plugin's own log lines so a test
+   * can assert the warning the user actually sees. `log()` routes through
+   * `client.app.log`, so the capture wraps that call.
+   */
+  async function runConfigHookCapturingLogs(
+    baseURL: string,
+  ): Promise<{ config: OpenCodeConfig; logs: string[] }> {
+    const logs: string[] = []
+    const plugin = await LiteLLMPlugin({
+      client: {
+        app: {
+          log: vi.fn(async ({ body }: { body: { message: string } }) => {
+            logs.push(body.message)
+          }),
+        },
+      },
+    } as never)
+    const config: OpenCodeConfig = {
+      provider: {
+        litellm: {
+          npm: '@ai-sdk/openai-compatible',
+          name: 'LiteLLM (proxy)',
+          options: { baseURL, apiKey: 'example-key' },
+          models: {},
+        },
+      },
+    }
+    await plugin.config!(config as never)
+    return { config, logs }
   }
 
   it('applies modelNameTemplate to discovered models and leaves curated names alone', async () => {
@@ -740,6 +775,62 @@ describe('OpenCode 1 config hook', () => {
     expect(Object.keys(config.provider['litellm-responses'].models ?? {})).toEqual([
       'responses-model',
     ])
+  })
+
+  it('keeps the provider usable from the cache when every health attempt fails', async () => {
+    useIsolatedState()
+    const baseURL = 'http://127.0.0.1:45570/v1'
+    process.env.OPENCODE_LITELLM_HEALTH_ATTEMPTS = '2'
+    const cacheKey = buildCacheKey(
+      'litellm',
+      'http://127.0.0.1:45570',
+      {},
+      {},
+      { formatModelNames: true },
+      'example-key',
+    )
+    let attempts = 0
+    globalThis.fetch = vi.fn(async () => {
+      attempts++
+      // Stands in for a second OpenCode start (or a background refresh) that
+      // writes the cache while this start is still retrying the probe: the
+      // fallback read must pick it up instead of leaving the provider empty.
+      writeModelCache(cacheKey, { 'cached-model': { name: 'Cached Model' } })
+      throw new Error('connect ECONNREFUSED 127.0.0.1:45570')
+    })
+
+    const { config, logs } = await runConfigHookCapturingLogs(baseURL)
+
+    expect(attempts).toBe(2)
+    expect(Object.keys(config.provider.litellm.models ?? {})).toEqual(['cached-model'])
+    expect(logs).toContainEqual(
+      expect.stringContaining('LiteLLM appears offline or unauthorized for provider "litellm"'),
+    )
+    // The cause stays verbatim and the attempt count is stated.
+    expect(logs).toContainEqual(
+      expect.stringMatching(
+        /\(connection refused: connect ECONNREFUSED 127\.0\.0\.1:45570\) after 2 attempts$/,
+      ),
+    )
+    expect(logs).toContainEqual(expect.stringContaining('kept 1 model(s) from cache'))
+  })
+
+  it('registers the provider without models and does not throw when no cache exists either', async () => {
+    useIsolatedState()
+    const baseURL = 'http://127.0.0.1:45571/v1'
+    process.env.OPENCODE_LITELLM_HEALTH_ATTEMPTS = '1'
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error('getaddrinfo ENOTFOUND litellm-proxy')
+    })
+
+    const { config, logs } = await runConfigHookCapturingLogs(baseURL)
+
+    expect(config.provider.litellm).toBeDefined()
+    expect(config.provider.litellm.models).toEqual({})
+    expect(logs).toContainEqual(
+      expect.stringContaining('(DNS lookup failed: getaddrinfo ENOTFOUND litellm-proxy) after 1 attempt'),
+    )
+    expect(logs).toContainEqual(expect.stringContaining('no cached models exist for it'))
   })
 
   it('creates no sibling when the only Responses model is filtered out', async () => {

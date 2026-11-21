@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { buildAPIURL, discoverLiteLLMModelInfo, getRequestTimeoutMs, normalizeBaseURL } from '../src/utils/litellm-api'
+import {
+  buildAPIURL,
+  discoverLiteLLMModelInfo,
+  getHealthAttempts,
+  getHealthRetryBudgetMs,
+  getRequestTimeoutMs,
+  normalizeBaseURL,
+  probeLiteLLMHealthWithRetry,
+} from '../src/utils/litellm-api'
 
 const TIMEOUT_ENV = 'LITELLM_REQUEST_TIMEOUT_MS'
 
@@ -318,6 +326,125 @@ describe('getRequestTimeoutMs', () => {
       process.env[TIMEOUT_ENV] = invalid
       expect(getRequestTimeoutMs()).toBe(15000)
     }
+  })
+})
+
+/**
+ * A proxy that is still booting refuses the first connection and answers a
+ * moment later. These tests pin the retry sequence (attempts, gaps, verdict)
+ * and the wording that makes the cause obvious in the log.
+ */
+describe('start-up health retries', () => {
+  const ATTEMPTS_ENV = 'OPENCODE_LITELLM_HEALTH_ATTEMPTS'
+  const HEALTH_TIMEOUT_ENV = 'OPENCODE_LITELLM_HEALTH_TIMEOUT_MS'
+
+  afterEach(() => {
+    delete process.env[ATTEMPTS_ENV]
+    delete process.env[HEALTH_TIMEOUT_ENV]
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+
+  it('returns healthy when the third attempt succeeds, after 400ms then 1200ms', async () => {
+    vi.useFakeTimers()
+    let attempts = 0
+    const fetchMock = vi.fn(async () => {
+      attempts++
+      if (attempts < 3) throw new Error('connect ECONNREFUSED 127.0.0.1:27740')
+      return Response.json({ data: [] })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const pending = probeLiteLLMHealthWithRetry('http://litellm-proxy:27740')
+
+    // Nothing happens before the first gap elapses.
+    await vi.advanceTimersByTimeAsync(399)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    // The second gap is longer than the first.
+    await vi.advanceTimersByTimeAsync(1199)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+
+    await expect(pending).resolves.toMatchObject({ healthy: true, attempts: 3 })
+  })
+
+  it('reports the last failure and the attempt count when every attempt fails', async () => {
+    process.env[ATTEMPTS_ENV] = '2'
+    const fetchMock = vi.fn(async () => {
+      throw new Error('getaddrinfo ENOTFOUND litellm-proxy')
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await probeLiteLLMHealthWithRetry('http://litellm-proxy:27740')
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(result).toMatchObject({
+      healthy: false,
+      kind: 'unreachable',
+      cause: 'dns',
+      attempts: 2,
+    })
+    if (result.healthy || result.kind !== 'unreachable') {
+      throw new Error('expected an unreachable verdict')
+    }
+    // The raw transport error stays visible, with the failing layer named.
+    expect(result.message).toBe('DNS lookup failed: getaddrinfo ENOTFOUND litellm-proxy')
+  })
+
+  it('names a refused connection without swallowing the raw error', async () => {
+    const fetchMock = vi.fn(async () => {
+      throw new Error('connect ECONNREFUSED 127.0.0.1:27740')
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await probeLiteLLMHealthWithRetry('http://127.0.0.1:27740', undefined, undefined, 1)
+
+    expect(result).toMatchObject({
+      healthy: false,
+      kind: 'unreachable',
+      cause: 'refused',
+      attempts: 1,
+    })
+    if (result.healthy || result.kind !== 'unreachable') {
+      throw new Error('expected an unreachable verdict')
+    }
+    expect(result.message).toBe('connection refused: connect ECONNREFUSED 127.0.0.1:27740')
+  })
+
+  it('disables the retry when OPENCODE_LITELLM_HEALTH_ATTEMPTS=1', async () => {
+    process.env[ATTEMPTS_ENV] = '1'
+    const fetchMock = vi.fn(async () => {
+      throw new Error('connect ECONNREFUSED 127.0.0.1:27740')
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await probeLiteLLMHealthWithRetry('http://127.0.0.1:27740')
+
+    // A single probe: the fail-fast behaviour, with no backoff to wait out.
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(result).toMatchObject({ healthy: false, attempts: 1 })
+  })
+
+  it('falls back to three attempts for unset, invalid or below-one values', () => {
+    delete process.env[ATTEMPTS_ENV]
+    expect(getHealthAttempts()).toBe(3)
+    for (const invalid of ['0', '-2', 'abc', '2.5', '']) {
+      process.env[ATTEMPTS_ENV] = invalid
+      expect(getHealthAttempts()).toBe(3)
+    }
+    process.env[ATTEMPTS_ENV] = '5'
+    expect(getHealthAttempts()).toBe(5)
+  })
+
+  it('budgets every attempt plus every gap, so a caller cap cannot cut the retries', () => {
+    process.env[HEALTH_TIMEOUT_ENV] = '1000'
+    delete process.env[ATTEMPTS_ENV]
+    expect(getHealthRetryBudgetMs()).toBe(3 * 1000 + 400 + 1200)
+    process.env[ATTEMPTS_ENV] = '1'
+    expect(getHealthRetryBudgetMs()).toBe(1000)
   })
 })
 

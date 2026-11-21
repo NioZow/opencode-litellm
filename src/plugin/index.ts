@@ -3,9 +3,10 @@ import {
   autoDetectLiteLLM,
   discoverLiteLLMModelInfo,
   discoverLiteLLMModels,
+  getHealthRetryBudgetMs,
   getRequestTimeoutMs,
   normalizeBaseURL,
-  probeLiteLLMHealth,
+  probeLiteLLMHealthWithRetry,
   type LiteLLMHealthFailure,
 } from '../utils/litellm-api'
 import {
@@ -49,10 +50,16 @@ const RESPONSES_PROVIDER_SUFFIX = '-responses'
 const RESPONSES_NPM = '@ai-sdk/openai'
 // `@ai-sdk/openai` throws without an API key, even when the sign-in's `fetch` sends the real token.
 const SIGN_IN_PLACEHOLDER = 'litellm-sign-in'
-// Covers the health-check budget plus the parallel models/model-info
-// fetch phase, with headroom. Scales with LITELLM_REQUEST_TIMEOUT_MS so
-// slow proxies aren't cut off by the overall cap either (issue #20).
-export const DISCOVERY_TIMEOUT_MS = Math.max(20000, getRequestTimeoutMs() + 5000)
+// Covers the health-check budget (every retry attempt included, so the cap
+// below can never silently cut a retry sequence short) plus the parallel
+// models/model-info fetch phase, with headroom. Scales with
+// LITELLM_REQUEST_TIMEOUT_MS so slow proxies aren't cut off by the overall
+// cap either (issue #20).
+export const DISCOVERY_TIMEOUT_MS = Math.max(
+  20000,
+  getRequestTimeoutMs() + 5000,
+  getHealthRetryBudgetMs() + getRequestTimeoutMs() + 5000,
+)
 // Don't revalidate a baseURL's cache more often than this, so a burst
 // of `session.created` events can't generate repeated discovery traffic.
 const REFRESH_MIN_INTERVAL_MS = 5 * 60 * 1000 // 5 minutes
@@ -444,21 +451,27 @@ export function toConfigModel(
  * unauthorized: the remedy (wait, or raise the timeout) is different from
  * the remedy for a rejected key. The `LiteLLM appears offline or
  * unauthorized` prefix is kept for the non-2xx and transport cases so
- * existing log scrapes still match.
+ * existing log scrapes still match, and the underlying cause (a verbatim
+ * `getaddrinfo ENOTFOUND …`, `connect ECONNREFUSED …`, `HTTP 401`) stays
+ * inside the parentheses. The attempt count is appended because "offline
+ * after 3 attempts" reads differently from "offline", and because a single
+ * attempt is what `OPENCODE_LITELLM_HEALTH_ATTEMPTS=1` produces.
  */
 function healthFailureMessage(
   failure: LiteLLMHealthFailure,
   providerId: string,
   baseURL: string,
 ): string {
+  const attempts = failure.attempts ?? 1
+  const attemptSuffix = attempts === 1 ? ' after 1 attempt' : ` after ${attempts} attempts`
   if (failure.kind === 'timeout') {
-    return `[opencode-litellm] LiteLLM health check timed out after ${failure.timeoutMs}ms for provider "${providerId}" at ${baseURL}`
+    return `[opencode-litellm] LiteLLM health check timed out after ${failure.timeoutMs}ms for provider "${providerId}" at ${baseURL}${attemptSuffix}`
   }
   const prefix = `[opencode-litellm] LiteLLM appears offline or unauthorized for provider "${providerId}" at ${baseURL}`
   if (failure.kind === 'http') {
-    return `${prefix} (HTTP ${failure.status} ${failure.statusText})`
+    return `${prefix} (HTTP ${failure.status} ${failure.statusText})${attemptSuffix}`
   }
-  return `${prefix} (${failure.message})`
+  return `${prefix} (${failure.message})${attemptSuffix}`
 }
 
 /**
@@ -504,7 +517,7 @@ export async function discoverModels(
   capabilities: ModelCapabilities = {},
   naming: ModelNaming = {},
 ): Promise<DiscoveredModels | null> {
-  const health = await probeLiteLLMHealth(baseURL, apiKey, customHeaders)
+  const health = await probeLiteLLMHealthWithRetry(baseURL, apiKey, customHeaders)
   if (!health.healthy) {
     log('warn', healthFailureMessage(health, providerId, baseURL))
     return null
@@ -1262,6 +1275,46 @@ export const LiteLLMPlugin: Plugin = async (input: PluginInput) => {
             discovered.hints,
             discovered.displayNames,
           )
+        } else {
+          /*
+          Every health attempt failed (or the overall cap expired) on an
+          already-empty cache. Giving up here is what used to make a
+          start-up blip require a server restart: OpenCode reads provider
+          config once, at start-up, so a provider left without models stays
+          without models for the whole session. Re-read the cache instead —
+          a concurrent OpenCode start, or a background refresh that landed
+          while the retries were running, can have written it in the
+          meantime — and go on with whatever it holds. Never throw: a plugin
+          that fails to load takes every other provider down with it.
+          */
+          const fallback = readModelCacheEntry(cacheKey)
+          const fallbackCount = fallback ? Object.keys(fallback.models).length : 0
+          if (fallback && fallbackCount > 0) {
+            const added = injectDiscoveredModels(
+              config,
+              providerId,
+              actualProvider,
+              models,
+              fallback.models,
+              fallback.responsesIds,
+              fallback.displayNames,
+              baseURL,
+              runtimeKey,
+              customHeaders,
+              runtimeFetch,
+              naming,
+            )
+            injectedModelIds.set(cacheKey, new Set(added))
+            log(
+              'warn',
+              `[opencode-litellm] LiteLLM unavailable for provider "${providerId}" at ${baseURL}; kept ${fallbackCount} model(s) from cache so the provider stays usable.`,
+            )
+          } else {
+            log(
+              'warn',
+              `[opencode-litellm] LiteLLM unavailable for provider "${providerId}" at ${baseURL} and no cached models exist for it; the provider is registered without models. It fills in on the next start once the proxy answers, or after a background refresh.`,
+            )
+          }
         }
       }
     },
